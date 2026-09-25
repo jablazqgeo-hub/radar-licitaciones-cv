@@ -7,6 +7,7 @@ import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
+from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -88,7 +89,6 @@ def find_link(entry: ET.Element) -> str:
 
 
 def find_contracting_party(entry: ET.Element) -> tuple[str, str]:
-    """Devuelve (órgano, texto de dirección) priorizando el bloque ContractingParty."""
     for node in entry.iter():
         if lname(node.tag) == "ContractingParty":
             names = []
@@ -98,51 +98,42 @@ def find_contracting_party(entry: ET.Element) -> tuple[str, str]:
             organ = names[0] if names else ""
             addr_parts = child_texts(node, {"CityName", "PostalZone", "CountrySubentity", "AddressLine", "Line"})
             return organ, " | ".join(addr_parts)
-    # fallback muy conservador
-    organ = first_text(entry, {"RegistrationName"})
-    return organ, ""
+    return first_text(entry, {"RegistrationName"}), ""
 
 
 def procurement_text(entry: ET.Element, title: str) -> tuple[str, str]:
-    """Extrae solo el objeto del contrato, evitando metadatos generales que causaban falsos positivos."""
     parts = []
+    # El objeto contractual vive normalmente en ProcurementProject / Lot.
     for node in entry.iter():
         if lname(node.tag) in {"ProcurementProject", "ProcurementProjectLot"}:
             parts.extend(child_texts(node, {"Name", "Description", "Note"}))
-    # Atom summary suele contener el objeto si el bloque UBL no trae descripción.
+    # Fallbacks de Atom/CODICE útiles sin incorporar todo el XML.
     parts.extend(child_texts(entry, {"summary"}))
-    cleaned = []
-    seen = set()
+    cleaned, seen = [], set()
     for p in parts:
         k = norm(p)
         if k and k not in seen:
             seen.add(k)
             cleaned.append(p)
-    description = " | ".join(cleaned)
-    return title, description
-
-
-def _contains_any(text: str, terms: list[str]) -> bool:
-    t = norm(text)
-    return any(norm(x) in t for x in terms)
+    return title, " | ".join(cleaned)
 
 
 def category_scores(title: str, description: str, cpvs: list[str]) -> tuple[list[str], int, str] | None:
     t_title = norm(title)
     t_desc = norm(description)
+    combined = f"{t_title} {t_desc}"
 
     title_negative = [x for x in NEGATIVE_TITLE_TERMS if norm(x) in t_title]
     strong_service = any(norm(x) in t_title for x in [
         "asistencia técnica", "asistencia tecnica", "consultoría", "consultoria",
-        "redacción", "redaccion", "elaboración", "elaboracion", "estudio de", "plan de"
+        "redacción", "redaccion", "elaboración", "elaboracion", "estudio de", "plan de",
+        "estrategia", "diagnóstico", "diagnostico",
     ])
     if title_negative and not strong_service:
         return None
 
-    categories = []
-    matched_terms = []
+    categories, matched_terms = [], []
     score = 0
-
     for cat, cfg in CATEGORIES.items():
         found_title = [kw for kw in cfg["keywords"] if norm(kw) in t_title]
         found_desc = [kw for kw in cfg["keywords"] if norm(kw) in t_desc]
@@ -152,35 +143,33 @@ def category_scores(title: str, description: str, cpvs: list[str]) -> tuple[list
                 if kw not in matched_terms:
                     matched_terms.append(kw)
             if found_title:
-                score += min(46, 30 + 6 * (len(found_title) - 1))
-            elif found_desc:
-                score += min(30, 18 + 4 * (len(found_desc) - 1))
+                score += min(48, 32 + 6 * (len(found_title) - 1))
+            else:
+                score += min(32, 20 + 4 * (len(found_desc) - 1))
 
     if not categories:
         return None
 
     intent_title = [x for x in PLANNING_INTENT_TERMS if norm(x) in t_title]
     intent_desc = [x for x in PLANNING_INTENT_TERMS if norm(x) in t_desc]
-    strong_plan = [x for x in STRONG_PLAN_TERMS if norm(x) in f"{t_title} {t_desc}"]
+    strong_plan = [x for x in STRONG_PLAN_TERMS if norm(x) in combined]
 
-    # Para evitar obras, suministros, auditorías, mantenimiento, etc., exigimos una señal clara de planificación.
+    # Exigimos intención de planificación, salvo que aparezca un instrumento inequívoco.
     if not intent_title and not intent_desc and not strong_plan:
         return None
 
     if intent_title:
-        score += min(28, 18 + 4 * (len(intent_title) - 1))
+        score += min(30, 20 + 4 * (len(intent_title) - 1))
     elif intent_desc:
-        score += min(16, 10 + 2 * (len(intent_desc) - 1))
+        score += min(18, 12 + 2 * (len(intent_desc) - 1))
     if strong_plan:
-        score += min(20, 12 + 4 * (len(strong_plan) - 1))
+        score += min(22, 14 + 4 * (len(strong_plan) - 1))
 
     digits = [re.sub(r"\D", "", cpv) for cpv in cpvs]
     if any(any(c.startswith(prefix) for prefix in CPV_PREFIXES) for c in digits):
         score += 10
 
-    # Penalización residual por objetos típicamente no estratégicos aunque contengan términos temáticos.
     score -= min(35, 20 * len(title_negative))
-
     return categories, max(0, min(100, score)), ", ".join(dict.fromkeys(matched_terms[:8]))
 
 
@@ -194,15 +183,13 @@ def _province_from_postcode(text: str) -> str:
 def is_cv_local(organ: str, address: str, full_text: str) -> bool:
     local_text = f"{organ} {full_text}"
     geo_text = f"{address} {organ} {full_text}"
-    t_geo = norm(geo_text)
-    t_local = norm(local_text)
+    t_geo, t_local = norm(geo_text), norm(local_text)
     cv = any(norm(x) in t_geo for x in CV_TERMS) or bool(_province_from_postcode(geo_text))
     local = any(norm(x) in t_local for x in LOCAL_BODY_TERMS)
     return cv and local
 
 
 def guess_province(address: str, organ: str, title: str, full_text: str) -> str:
-    # Dirección del órgano primero; evita asignar Valencia solo porque aparezca en otro metadato.
     for source in [address, organ, title, full_text]:
         by_pc = _province_from_postcode(source)
         if by_pc:
@@ -212,7 +199,7 @@ def guess_province(address: str, organ: str, title: str, full_text: str) -> str:
             return "Alicante"
         if "castellon" in t or "castello" in t:
             return "Castellón"
-        if "valencia" in t or "valencia" in t:
+        if "valencia" in t:
             return "Valencia"
     return "Sin determinar"
 
@@ -290,13 +277,13 @@ def parse_entry(entry: ET.Element, source: str, cutoff: datetime | None) -> Tend
     )
 
 
-def download_atom(url: str, max_mb: int = 160) -> str:
+def download_atom(url: str, max_mb: int = 80) -> str:
     tmp = tempfile.NamedTemporaryFile(suffix=".atom", delete=False)
     path = tmp.name
     tmp.close()
     total = 0
     try:
-        with requests.get(url, timeout=(15, 90), stream=True, headers={"User-Agent": "RadarLicitacionesCV/4.0"}) as r:
+        with requests.get(url, timeout=(15, 75), stream=True, headers={"User-Agent": "RadarLicitacionesCV/5.0"}) as r:
             r.raise_for_status()
             with open(path, "wb") as f:
                 for chunk in r.iter_content(1024 * 1024):
@@ -304,7 +291,7 @@ def download_atom(url: str, max_mb: int = 160) -> str:
                         continue
                     total += len(chunk)
                     if total > max_mb * 1024 * 1024:
-                        raise RuntimeError(f"El feed supera {max_mb} MB; se cancela para evitar bloquear la app")
+                        raise RuntimeError(f"El fichero supera {max_mb} MB")
                     f.write(chunk)
         return path
     except Exception:
@@ -313,6 +300,37 @@ def download_atom(url: str, max_mb: int = 160) -> str:
         except OSError:
             pass
         raise
+
+
+def feed_prev_link(path: str, base_url: str) -> str | None:
+    try:
+        root = ET.parse(path).getroot()
+        # Solo links hijos directos del feed; no enlaces de cada entry.
+        for node in list(root):
+            if lname(node.tag) == "link" and node.attrib.get("rel") == "prev":
+                href = (node.attrib.get("href") or "").strip()
+                if href:
+                    return urljoin(base_url, href)
+    except Exception:
+        return None
+    return None
+
+
+def page_date_range(path: str) -> tuple[datetime | None, datetime | None]:
+    newest = oldest = None
+    try:
+        for _event, elem in ET.iterparse(path, events=("end",)):
+            if lname(elem.tag) == "entry":
+                dt = parse_dt(first_text(elem, {"updated"}))
+                if dt is not None:
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    newest = dt if newest is None or dt > newest else newest
+                    oldest = dt if oldest is None or dt < oldest else oldest
+                elem.clear()
+    except ET.ParseError:
+        pass
+    return newest, oldest
 
 
 def parse_atom_path(path: str, source: str, cutoff: datetime | None) -> list[Tender]:
@@ -331,23 +349,54 @@ def parse_atom_path(path: str, source: str, cutoff: datetime | None) -> list[Ten
     return out
 
 
-def load_recent(days: int = 30) -> tuple[pd.DataFrame, list[str]]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    all_tenders, errors = [], []
-    for source, url in FEEDS.items():
+def load_feed_history(source: str, first_url: str, cutoff: datetime, max_pages: int = 180) -> tuple[list[Tender], list[str], int]:
+    """Recorre rel=prev desde el feed más reciente hasta cubrir cutoff."""
+    tenders, errors = [], []
+    seen_urls = set()
+    url = first_url
+    pages = 0
+
+    while url and url not in seen_urls and pages < max_pages:
+        seen_urls.add(url)
         path = None
         try:
             path = download_atom(url)
-            all_tenders.extend(parse_atom_path(path, source, cutoff))
+            pages += 1
+            newest, oldest = page_date_range(path)
+            tenders.extend(parse_atom_path(path, source, cutoff))
+            prev_url = feed_prev_link(path, url)
+
+            # Si la página ya cruza la fecha de corte, no necesitamos páginas más antiguas.
+            if oldest is not None and oldest < cutoff:
+                break
+            if not prev_url:
+                break
+            url = prev_url
         except Exception as exc:
-            errors.append(f"{source}: {exc}")
+            errors.append(f"{source} (página {pages + 1}): {exc}")
+            break
         finally:
             if path:
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-    return to_dataframe(all_tenders), errors
+
+    if pages >= max_pages:
+        errors.append(f"{source}: se alcanzó el límite de {max_pages} páginas antes de completar todo el periodo")
+    return tenders, errors, pages
+
+
+def load_recent(days: int = 30) -> tuple[pd.DataFrame, list[str], int]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    all_tenders, errors = [], []
+    total_pages = 0
+    for source, url in FEEDS.items():
+        tenders, errs, pages = load_feed_history(source, url, cutoff)
+        all_tenders.extend(tenders)
+        errors.extend(errs)
+        total_pages += pages
+    return to_dataframe(all_tenders), errors, total_pages
 
 
 def to_dataframe(tenders: list[Tender]) -> pd.DataFrame:
