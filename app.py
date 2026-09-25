@@ -20,11 +20,11 @@ with st.sidebar:
     st.header("1. Actualizar radar")
     days = st.selectbox("Buscar actualizaciones de los últimos", [7, 14, 30, 60, 90], index=2, format_func=lambda x: f"{x} días")
     if st.button("Actualizar ahora", type="primary", use_container_width=True):
-        status = st.status("Consultando los feeds diarios oficiales de PLACSP…", expanded=True)
+        status = st.status("Consultando y depurando los feeds oficiales de PLACSP…", expanded=True)
         try:
             df, errors = cached_recent(int(days))
             st.session_state.df = df
-            status.update(label=f"Listo: {len(df)} oportunidades detectadas", state="complete", expanded=False)
+            status.update(label=f"Listo: {len(df)} oportunidades de planificación detectadas", state="complete", expanded=False)
             if errors:
                 st.warning("Alguna fuente oficial no respondió correctamente:\n\n" + "\n\n".join(errors))
         except Exception as exc:
@@ -40,11 +40,12 @@ with st.sidebar:
 
 df = st.session_state.df.copy()
 if df.empty:
-    st.info("Pulsa «Actualizar ahora». Esta versión consulta los feeds ATOM diarios oficiales, en lugar de descargar los ZIP mensuales nacionales.")
+    st.info("Pulsa «Actualizar ahora». El radar filtra servicios de planificación/consultoría y descarta obras, suministros, mantenimiento y otros falsos positivos frecuentes.")
     st.stop()
 
 filtered = df[df["relevancia"] >= min_score].copy()
-if selected_provinces: filtered = filtered[filtered["provincia"].isin(selected_provinces)]
+if selected_provinces:
+    filtered = filtered[filtered["provincia"].isin(selected_provinces)]
 if selected_categories:
     pattern = "|".join(re.escape(x) for x in selected_categories)
     filtered = filtered[filtered["categorias"].str.contains(pattern, case=False, regex=True, na=False)]
@@ -55,17 +56,20 @@ if search.strip():
         mask |= filtered[col].str.contains(q, case=False, regex=False, na=False)
     filtered = filtered[mask]
 
-c1,c2,c3 = st.columns(3)
+c1, c2, c3 = st.columns(3)
 c1.metric("Oportunidades", len(filtered))
 c2.metric("Alta relevancia (≥70)", int((filtered["relevancia"] >= 70).sum()))
-c3.metric("Organismos", filtered["organo"].nunique())
+c3.metric("Organismos", filtered.loc[filtered["organo"] != "Sin identificar", "organo"].nunique())
 
 st.subheader("Oportunidades detectadas")
-cols = ["relevancia","titulo","organo","provincia","categorias","fecha_actualizacion","fecha_limite","presupuesto","cpv","coincidencias","enlace"]
-view = filtered.sort_values(["relevancia","fecha_actualizacion"], ascending=[False,False])[cols]
+cols = ["relevancia", "titulo", "organo", "provincia", "categorias", "fecha_actualizacion", "fecha_limite", "presupuesto", "cpv", "coincidencias", "enlace"]
+view = filtered.sort_values(["relevancia", "fecha_actualizacion"], ascending=[False, False])[cols]
 st.dataframe(view, use_container_width=True, hide_index=True, column_config={
     "relevancia": st.column_config.ProgressColumn("Relevancia", min_value=0, max_value=100, format="%d"),
+    "titulo": st.column_config.TextColumn("Licitación", width="large"),
+    "organo": st.column_config.TextColumn("Órgano", width="medium"),
+    "categorias": st.column_config.TextColumn("Familia", width="medium"),
     "enlace": st.column_config.LinkColumn("Enlace oficial"),
 })
 st.download_button("⬇️ Exportar CSV", filtered.to_csv(index=False).encode("utf-8-sig"), "radar_licitaciones_cv.csv", "text/csv")
-st.caption("Fuente: feeds ATOM oficiales de PLACSP. La puntuación indica afinidad temática; revisa siempre los pliegos oficiales.")
+st.caption("Fuente: feeds ATOM oficiales de PLACSP. El radar prioriza contratos de planificación, estudios, estrategias, redacción y asistencia técnica; revisa siempre los pliegos oficiales.")
