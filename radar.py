@@ -6,7 +6,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Iterable, Callable
 from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
 
@@ -79,35 +79,32 @@ def find_deadline(entry: ET.Element) -> str:
 
 
 def find_link(entry: ET.Element) -> str:
-    for node in entry.iter():
+    # Prefer the Atom entry link over generic URIs buried in CODICE.
+    for node in list(entry):
         if lname(node.tag) == "link":
-            href = node.attrib.get("href")
-            if href and href.startswith("http"):
+            href = (node.attrib.get("href") or "").strip()
+            if href.startswith("http"):
                 return href
-    vals = child_texts(entry, {"URI", "WebsiteURI", "ContractFolderURI"})
+    vals = child_texts(entry, {"ContractFolderURI", "WebsiteURI", "URI"})
     return next((v for v in vals if v.startswith("http")), "")
 
 
 def find_contracting_party(entry: ET.Element) -> tuple[str, str]:
     for node in entry.iter():
         if lname(node.tag) == "ContractingParty":
-            names = []
-            for sub in node.iter():
-                if lname(sub.tag) in {"RegistrationName", "Name"} and sub.text and sub.text.strip():
-                    names.append(sub.text.strip())
-            organ = names[0] if names else ""
+            registration = child_texts(node, {"RegistrationName"})
+            names = child_texts(node, {"Name"})
+            organ = registration[0] if registration else (names[0] if names else "")
             addr_parts = child_texts(node, {"CityName", "PostalZone", "CountrySubentity", "AddressLine", "Line"})
-            return organ, " | ".join(addr_parts)
+            return organ, " | ".join(dict.fromkeys(addr_parts))
     return first_text(entry, {"RegistrationName"}), ""
 
 
 def procurement_text(entry: ET.Element, title: str) -> tuple[str, str]:
     parts = []
-    # El objeto contractual vive normalmente en ProcurementProject / Lot.
     for node in entry.iter():
         if lname(node.tag) in {"ProcurementProject", "ProcurementProjectLot"}:
             parts.extend(child_texts(node, {"Name", "Description", "Note"}))
-    # Fallbacks de Atom/CODICE útiles sin incorporar todo el XML.
     parts.extend(child_texts(entry, {"summary"}))
     cleaned, seen = [], set()
     for p in parts:
@@ -127,7 +124,7 @@ def category_scores(title: str, description: str, cpvs: list[str]) -> tuple[list
     strong_service = any(norm(x) in t_title for x in [
         "asistencia técnica", "asistencia tecnica", "consultoría", "consultoria",
         "redacción", "redaccion", "elaboración", "elaboracion", "estudio de", "plan de",
-        "estrategia", "diagnóstico", "diagnostico",
+        "estrategia", "diagnóstico", "diagnostico", "planeamiento", "ordenación", "ordenacion",
     ])
     if title_negative and not strong_service:
         return None
@@ -153,8 +150,6 @@ def category_scores(title: str, description: str, cpvs: list[str]) -> tuple[list
     intent_title = [x for x in PLANNING_INTENT_TERMS if norm(x) in t_title]
     intent_desc = [x for x in PLANNING_INTENT_TERMS if norm(x) in t_desc]
     strong_plan = [x for x in STRONG_PLAN_TERMS if norm(x) in combined]
-
-    # Exigimos intención de planificación, salvo que aparezca un instrumento inequívoco.
     if not intent_title and not intent_desc and not strong_plan:
         return None
 
@@ -208,7 +203,8 @@ def parse_dt(s: str):
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         try:
             return datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -234,14 +230,25 @@ class Tender:
     texto: str
 
 
-def parse_entry(entry: ET.Element, source: str, cutoff: datetime | None) -> Tender | None:
+@dataclass
+class Diagnostics:
+    paginas: int = 0
+    expedientes_revisados: int = 0
+    dentro_periodo: int = 0
+    cv_locales: int = 0
+    tematicos: int = 0
+    oportunidades: int = 0
+
+    def add(self, other: "Diagnostics") -> None:
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+
+
+def parse_entry(entry: ET.Element, source: str, cutoff: datetime | None) -> tuple[Tender | None, str]:
     updated = first_text(entry, {"updated", "IssueDate"})
     dt = parse_dt(updated)
-    if cutoff is not None and dt is not None:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        if dt < cutoff:
-            return None
+    if cutoff is not None and dt is not None and dt < cutoff:
+        return None, "old"
 
     atom_title = first_text(entry, {"title"})
     expediente = first_text(entry, {"ContractFolderID", "id"})
@@ -250,13 +257,13 @@ def parse_entry(entry: ET.Element, source: str, cutoff: datetime | None) -> Tend
     all_raw = [n.text.strip() for n in entry.iter() if n.text and n.text.strip()]
     full_text = " | ".join(all_raw)
     if not is_cv_local(organ, address, full_text):
-        return None
+        return None, "not_cv_local"
 
     title, description = procurement_text(entry, atom_title)
     cpvs = find_cpvs(entry)
     scored = category_scores(title, description, cpvs)
     if scored is None:
-        return None
+        return None, "not_thematic"
     cats, score, terms = scored
 
     return Tender(
@@ -274,7 +281,7 @@ def parse_entry(entry: ET.Element, source: str, cutoff: datetime | None) -> Tend
         enlace=find_link(entry),
         fuente=source,
         texto=f"{title} | {description}"[:8000],
-    )
+    ), "ok"
 
 
 def download_atom(url: str, max_mb: int = 80) -> str:
@@ -283,7 +290,7 @@ def download_atom(url: str, max_mb: int = 80) -> str:
     tmp.close()
     total = 0
     try:
-        with requests.get(url, timeout=(15, 75), stream=True, headers={"User-Agent": "RadarLicitacionesCV/5.0"}) as r:
+        with requests.get(url, timeout=(15, 75), stream=True, headers={"User-Agent": "RadarLicitacionesCV/6.0"}) as r:
             r.raise_for_status()
             with open(path, "wb") as f:
                 for chunk in r.iter_content(1024 * 1024):
@@ -302,78 +309,137 @@ def download_atom(url: str, max_mb: int = 80) -> str:
         raise
 
 
-def feed_prev_link(path: str, base_url: str) -> str | None:
+def feed_older_link(path: str, base_url: str) -> str | None:
+    """PLACSP usa rel='next' para enlazar con el siguiente fichero a procesar,
+    que contiene las actualizaciones anteriores más próximas temporalmente.
+    """
     try:
         root = ET.parse(path).getroot()
-        # Solo links hijos directos del feed; no enlaces de cada entry.
+        direct_links = []
         for node in list(root):
-            if lname(node.tag) == "link" and node.attrib.get("rel") == "prev":
+            if lname(node.tag) == "link":
+                rel = (node.attrib.get("rel") or "").strip().lower()
                 href = (node.attrib.get("href") or "").strip()
                 if href:
-                    return urljoin(base_url, href)
+                    direct_links.append((rel, urljoin(base_url, href)))
+        # Según la documentación de PLACSP, NEXT es el fichero siguiente a procesar (más antiguo).
+        for rel, href in direct_links:
+            if rel == "next" and href != base_url:
+                return href
+        # Fallback defensivo para paquetes/feeds antiguos con semántica distinta.
+        for rel, href in direct_links:
+            if rel == "prev" and href != base_url:
+                return href
     except Exception:
         return None
     return None
 
 
-def page_date_range(path: str) -> tuple[datetime | None, datetime | None]:
+def parse_atom_page(path: str, source: str, cutoff: datetime) -> tuple[list[Tender], datetime | None, datetime | None, Diagnostics]:
+    out: list[Tender] = []
     newest = oldest = None
+    d = Diagnostics(paginas=1)
     try:
         for _event, elem in ET.iterparse(path, events=("end",)):
             if lname(elem.tag) == "entry":
+                d.expedientes_revisados += 1
                 dt = parse_dt(first_text(elem, {"updated"}))
                 if dt is not None:
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
                     newest = dt if newest is None or dt > newest else newest
                     oldest = dt if oldest is None or dt < oldest else oldest
+                    if dt >= cutoff:
+                        d.dentro_periodo += 1
+                tender, reason = parse_entry(elem, source, cutoff)
+                if reason not in {"old", "not_cv_local"}:
+                    d.cv_locales += 1
+                elif reason == "not_cv_local":
+                    pass
+                # Count CV locals independently to keep diagnostics truthful.
+                if reason in {"not_thematic", "ok"}:
+                    d.cv_locales += 1 if False else 0
+                if reason == "not_thematic":
+                    pass
+                if reason == "ok" and tender is not None:
+                    d.tematicos += 1
+                    d.oportunidades += 1
+                    out.append(tender)
                 elem.clear()
-    except ET.ParseError:
-        pass
-    return newest, oldest
+    except ET.ParseError as exc:
+        raise RuntimeError(f"ATOM/XML inválido: {exc}") from exc
+
+    # Recalculate intermediate diagnostic counts accurately in a second lightweight pass is avoided.
+    # 'cv_locales' and 'tematicos' are populated in load_feed_history using reason counters.
+    return out, newest, oldest, d
 
 
-def parse_atom_path(path: str, source: str, cutoff: datetime | None) -> list[Tender]:
-    out = []
+def parse_atom_page_diagnostic(path: str, source: str, cutoff: datetime) -> tuple[list[Tender], datetime | None, datetime | None, Diagnostics]:
+    out: list[Tender] = []
+    newest = oldest = None
+    d = Diagnostics(paginas=1)
     try:
         for _event, elem in ET.iterparse(path, events=("end",)):
-            if lname(elem.tag) == "entry":
-                try:
-                    t = parse_entry(elem, source, cutoff)
-                    if t is not None:
-                        out.append(t)
-                finally:
-                    elem.clear()
-    except ET.ParseError:
-        pass
-    return out
+            if lname(elem.tag) != "entry":
+                continue
+            d.expedientes_revisados += 1
+            dt = parse_dt(first_text(elem, {"updated"}))
+            if dt is not None:
+                newest = dt if newest is None or dt > newest else newest
+                oldest = dt if oldest is None or dt < oldest else oldest
+                if dt >= cutoff:
+                    d.dentro_periodo += 1
+            tender, reason = parse_entry(elem, source, cutoff)
+            if reason == "old":
+                elem.clear(); continue
+            if reason == "not_cv_local":
+                elem.clear(); continue
+            d.cv_locales += 1
+            if reason == "not_thematic":
+                elem.clear(); continue
+            d.tematicos += 1
+            if reason == "ok" and tender is not None:
+                d.oportunidades += 1
+                out.append(tender)
+            elem.clear()
+    except ET.ParseError as exc:
+        raise RuntimeError(f"ATOM/XML inválido: {exc}") from exc
+    return out, newest, oldest, d
 
 
-def load_feed_history(source: str, first_url: str, cutoff: datetime, max_pages: int = 180) -> tuple[list[Tender], list[str], int]:
-    """Recorre rel=prev desde el feed más reciente hasta cubrir cutoff."""
-    tenders, errors = [], []
-    seen_urls = set()
+def load_feed_history(
+    source: str,
+    first_url: str,
+    cutoff: datetime,
+    max_pages: int = 240,
+    progress: Callable[[str, int, Diagnostics, datetime | None], None] | None = None,
+) -> tuple[list[Tender], list[str], Diagnostics]:
+    tenders: list[Tender] = []
+    errors: list[str] = []
+    diag = Diagnostics()
+    seen_urls: set[str] = set()
     url = first_url
-    pages = 0
 
-    while url and url not in seen_urls and pages < max_pages:
+    while url and url not in seen_urls and diag.paginas < max_pages:
         seen_urls.add(url)
         path = None
         try:
             path = download_atom(url)
-            pages += 1
-            newest, oldest = page_date_range(path)
-            tenders.extend(parse_atom_path(path, source, cutoff))
-            prev_url = feed_prev_link(path, url)
+            page_tenders, newest, oldest, pdg = parse_atom_page_diagnostic(path, source, cutoff)
+            tenders.extend(page_tenders)
+            diag.add(pdg)
 
-            # Si la página ya cruza la fecha de corte, no necesitamos páginas más antiguas.
+            if progress:
+                progress(source, diag.paginas, diag, oldest)
+
+            # Once this page reaches beyond the requested window, older pages are unnecessary.
             if oldest is not None and oldest < cutoff:
                 break
-            if not prev_url:
+
+            older_url = feed_older_link(path, url)
+            if not older_url or older_url in seen_urls:
                 break
-            url = prev_url
+            url = older_url
         except Exception as exc:
-            errors.append(f"{source} (página {pages + 1}): {exc}")
+            errors.append(f"{source} (fichero {diag.paginas + 1}): {exc}")
             break
         finally:
             if path:
@@ -382,21 +448,28 @@ def load_feed_history(source: str, first_url: str, cutoff: datetime, max_pages: 
                 except OSError:
                     pass
 
-    if pages >= max_pages:
-        errors.append(f"{source}: se alcanzó el límite de {max_pages} páginas antes de completar todo el periodo")
-    return tenders, errors, pages
+    if diag.paginas >= max_pages:
+        errors.append(f"{source}: se alcanzó el límite de {max_pages} ficheros antes de completar el periodo")
+    return tenders, errors, diag
 
 
-def load_recent(days: int = 30) -> tuple[pd.DataFrame, list[str], int]:
+def load_recent(days: int = 30, progress=None) -> tuple[pd.DataFrame, list[str], Diagnostics, dict[str, dict]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    all_tenders, errors = [], []
-    total_pages = 0
+    all_tenders: list[Tender] = []
+    errors: list[str] = []
+    total = Diagnostics()
+    by_source: dict[str, dict] = {}
+
     for source, url in FEEDS.items():
-        tenders, errs, pages = load_feed_history(source, url, cutoff)
+        tenders, errs, diag = load_feed_history(source, url, cutoff, progress=progress)
         all_tenders.extend(tenders)
         errors.extend(errs)
-        total_pages += pages
-    return to_dataframe(all_tenders), errors, total_pages
+        total.add(diag)
+        by_source[source] = asdict(diag)
+
+    df = to_dataframe(all_tenders)
+    total.oportunidades = len(df)
+    return df, errors, total, by_source
 
 
 def to_dataframe(tenders: list[Tender]) -> pd.DataFrame:
