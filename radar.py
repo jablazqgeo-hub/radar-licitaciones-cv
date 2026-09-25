@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import tempfile
 import unicodedata
 import zipfile
 from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Iterable
+from typing import Iterable, Callable
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -28,7 +29,7 @@ def lname(tag: str) -> str:
 
 
 def child_texts(elem: ET.Element, wanted: set[str]) -> list[str]:
-    out = []
+    out: list[str] = []
     for node in elem.iter():
         if lname(node.tag) in wanted and node.text and node.text.strip():
             out.append(node.text.strip())
@@ -36,25 +37,22 @@ def child_texts(elem: ET.Element, wanted: set[str]) -> list[str]:
 
 
 def first_text(elem: ET.Element, names: Iterable[str]) -> str:
-    names = set(names)
-    vals = child_texts(elem, names)
+    vals = child_texts(elem, set(names))
     return vals[0] if vals else ""
 
 
 def find_amount(entry: ET.Element) -> str:
-    candidates = []
     for node in entry.iter():
         n = lname(node.tag).lower()
         if n in {"taxexclusiveamount", "estimatedoverallcontractamount", "totalamount"}:
             txt = (node.text or "").strip()
             if txt:
-                currency = node.attrib.get("currencyID", "EUR")
-                candidates.append(f"{txt} {currency}")
-    return candidates[0] if candidates else ""
+                return f"{txt} {node.attrib.get('currencyID', 'EUR')}"
+    return ""
 
 
 def find_cpvs(entry: ET.Element) -> list[str]:
-    vals = []
+    vals: list[str] = []
     for node in entry.iter():
         n = lname(node.tag).lower()
         if n in {"itemclassificationcode", "classificationcode"}:
@@ -75,61 +73,54 @@ def find_deadline(entry: ET.Element) -> str:
 
 
 def find_link(entry: ET.Element) -> str:
-    # Atom links
     for node in entry.iter():
         if lname(node.tag) == "link":
             href = node.attrib.get("href")
-            if href and "http" in href:
+            if href and href.startswith("http"):
                 return href
-    # CODICE / URI fields
     vals = child_texts(entry, {"URI", "WebsiteURI", "ContractFolderURI"})
     return next((v for v in vals if v.startswith("http")), "")
 
 
 def category_scores(text: str, cpvs: list[str]) -> tuple[list[str], int, str]:
     t = norm(text)
-    matches = []
-    matched_terms = []
+    matches: list[str] = []
+    matched_terms: list[str] = []
     score = 0
 
     for cat, cfg in CATEGORIES.items():
-        found = []
-        for kw in cfg["keywords"]:
-            nkw = norm(kw)
-            if nkw and nkw in t:
-                found.append(kw)
+        found = [kw for kw in cfg["keywords"] if norm(kw) in t]
         if found:
             matches.append(cat)
             matched_terms.extend(found[:5])
-            # Strong reward for exact thematic language; capped per category.
             score += min(36, 18 + 6 * (len(found) - 1))
 
-    if any(any(re.sub(r"\D", "", cpv).startswith(prefix) for prefix in CPV_PREFIXES) for cpv in cpvs):
+    if any(
+        any(re.sub(r"\D", "", cpv).startswith(prefix) for prefix in CPV_PREFIXES)
+        for cpv in cpvs
+    ):
         score += 10
 
-    # Extra relevance when the object looks like a study/plan/strategy/technical assistance.
     intent_terms = [
-        "plan", "estrategia", "estudio", "asistencia tecnica", "consultoria", "consultoría",
-        "redaccion", "redacción", "elaboracion", "elaboración", "diagnostico", "diagnóstico"
+        "plan", "estrategia", "estudio", "asistencia tecnica", "consultoria",
+        "redaccion", "elaboracion", "diagnostico"
     ]
-    intent_hits = sum(1 for x in intent_terms if norm(x) in t)
+    intent_hits = sum(1 for x in intent_terms if x in t)
     score += min(18, intent_hits * 4)
 
-    # Reduce false positives from construction-only tenders.
-    works_terms = ["ejecucion de obras", "ejecución de obras", "obra de", "suministro de"]
-    if any(norm(x) in t for x in works_terms) and not any(norm(x) in t for x in ["asistencia tecnica", "consultoria", "redaccion", "elaboracion"]):
+    works_terms = ["ejecucion de obras", "obra de", "suministro de"]
+    service_terms = ["asistencia tecnica", "consultoria", "redaccion", "elaboracion"]
+    if any(x in t for x in works_terms) and not any(x in t for x in service_terms):
         score -= 15
 
     return matches, max(0, min(100, score)), ", ".join(dict.fromkeys(matched_terms))
 
 
 def _province_from_postcode(text: str) -> str:
-    # Spanish postal codes begin with the province code: 03 Alicante, 12 Castellon, 46 Valencia.
     codes = re.findall(r"(?<!\d)(?:03|12|46)\d{3}(?!\d)", text or "")
     if not codes:
         return ""
-    prefix = codes[0][:2]
-    return {"03": "Alicante", "12": "Castellón", "46": "Valencia"}.get(prefix, "")
+    return {"03": "Alicante", "12": "Castellón", "46": "Valencia"}.get(codes[0][:2], "")
 
 
 def is_cv_local(text: str) -> bool:
@@ -171,73 +162,116 @@ class Tender:
     texto: str
 
 
-def parse_atom(xml_bytes: bytes, source: str = "PLACSP") -> list[Tender]:
-    root = ET.fromstring(xml_bytes)
-    entries = [x for x in root.iter() if lname(x.tag) == "entry"]
+def parse_entry(entry: ET.Element, source: str) -> Tender | None:
+    title = first_text(entry, {"title", "Name"})
+    expediente = first_text(entry, {"ContractFolderID", "ID", "id"})
+    updated = first_text(entry, {"updated", "IssueDate"})
+    organ = first_text(entry, {"PartyName", "RegistrationName"})
+
+    # Gather text only for this one entry; unlike ET.fromstring, this keeps memory bounded.
+    raw_texts = [
+        node.text.strip()
+        for node in entry.iter()
+        if node.text and node.text.strip()
+    ]
+    full_text = " | ".join(raw_texts)
+    geography_text = f"{organ} {full_text}"
+    if not is_cv_local(geography_text):
+        return None
+
+    cpvs = find_cpvs(entry)
+    cats, score, terms = category_scores(f"{title} {full_text}", cpvs)
+    if not cats:
+        return None
+
+    return Tender(
+        expediente=expediente,
+        titulo=title,
+        organo=organ,
+        provincia=guess_province(geography_text),
+        fecha_actualizacion=updated,
+        fecha_limite=find_deadline(entry),
+        presupuesto=find_amount(entry),
+        cpv=", ".join(cpvs),
+        categorias="; ".join(cats),
+        relevancia=score,
+        coincidencias=terms,
+        enlace=find_link(entry),
+        fuente=source,
+        texto=full_text[:8000],
+    )
+
+
+def parse_xml_stream(fileobj, source: str) -> list[Tender]:
+    """Parse Atom/XML incrementally instead of loading the whole national file in RAM."""
     tenders: list[Tender] = []
-
-    for entry in entries:
-        title = first_text(entry, {"title", "Name"})
-        expediente = first_text(entry, {"ContractFolderID", "ID", "id"})
-        updated = first_text(entry, {"updated", "IssueDate"})
-        organ = first_text(entry, {"PartyName", "RegistrationName"})
-        cpvs = find_cpvs(entry)
-        deadline = find_deadline(entry)
-        amount = find_amount(entry)
-        link = find_link(entry)
-
-        # Keep all textual values to make the classifier tolerant of schema changes.
-        raw_texts = []
-        for node in entry.iter():
-            if node.text and node.text.strip():
-                raw_texts.append(node.text.strip())
-        full_text = " | ".join(raw_texts)
-
-        # If PartyName is absent or ambiguous, the title/full text still participates in geographic filtering.
-        geography_text = f"{organ} {full_text}"
-        if not is_cv_local(geography_text):
-            continue
-
-        cats, score, terms = category_scores(f"{title} {full_text}", cpvs)
-        if not cats:
-            continue
-
-        tenders.append(Tender(
-            expediente=expediente,
-            titulo=title,
-            organo=organ,
-            provincia=guess_province(geography_text),
-            fecha_actualizacion=updated,
-            fecha_limite=deadline,
-            presupuesto=amount,
-            cpv=", ".join(cpvs),
-            categorias="; ".join(cats),
-            relevancia=score,
-            coincidencias=terms,
-            enlace=link,
-            fuente=source,
-            texto=full_text[:12000],
-        ))
+    try:
+        context = ET.iterparse(fileobj, events=("end",))
+        for _event, elem in context:
+            if lname(elem.tag) == "entry":
+                try:
+                    tender = parse_entry(elem, source)
+                    if tender is not None:
+                        tenders.append(tender)
+                finally:
+                    elem.clear()
+    except ET.ParseError:
+        return tenders
     return tenders
 
 
-def parse_zip_bytes(data: bytes, source: str) -> list[Tender]:
-    out = []
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+def parse_zip_path(path: str, source: str) -> list[Tender]:
+    out: list[Tender] = []
+    with zipfile.ZipFile(path) as zf:
         for name in zf.namelist():
-            if name.lower().endswith((".atom", ".xml")):
-                try:
-                    out.extend(parse_atom(zf.read(name), source=f"{source}: {name}"))
-                except Exception:
-                    # A malformed or auxiliary XML should not stop the whole import.
-                    continue
+            if not name.lower().endswith((".atom", ".xml")):
+                continue
+            try:
+                with zf.open(name) as fh:
+                    out.extend(parse_xml_stream(fh, source=f"{source}: {name}"))
+            except Exception:
+                continue
     return out
 
 
-def download_zip(url: str, timeout: int = 90) -> bytes:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "RadarLicitacionesCV/1.0"})
-    r.raise_for_status()
-    return r.content
+def parse_zip_bytes(data: bytes, source: str) -> list[Tender]:
+    # Used for manual uploads; still parses each XML as a stream.
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(data)
+        path = tmp.name
+    try:
+        return parse_zip_path(path, source)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def download_zip_to_temp(url: str, timeout: int = 180) -> str:
+    """Stream a large ZIP to disk to avoid holding the whole national dataset in memory."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    path = tmp.name
+    tmp.close()
+    try:
+        with requests.get(
+            url,
+            timeout=(20, timeout),
+            stream=True,
+            headers={"User-Agent": "RadarLicitacionesCV/2.0"},
+        ) as r:
+            r.raise_for_status()
+            with open(path, "wb") as fh:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        fh.write(chunk)
+        return path
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
 
 
 def month_urls(year: int, month: int) -> dict[str, str]:
@@ -248,14 +282,41 @@ def month_urls(year: int, month: int) -> dict[str, str]:
     }
 
 
+def load_month(year: int, month: int, status_cb: Callable[[str], None] | None = None) -> tuple[pd.DataFrame, list[str]]:
+    """Download/process sources one by one and return only the small filtered CV dataset."""
+    all_tenders: list[Tender] = []
+    errors: list[str] = []
+
+    for source, url in month_urls(year, month).items():
+        path = None
+        try:
+            if status_cb:
+                status_cb(f"Descargando {source}…")
+            path = download_zip_to_temp(url)
+            if status_cb:
+                status_cb(f"Analizando {source} y filtrando Comunitat Valenciana…")
+            all_tenders.extend(parse_zip_path(path, source))
+        except Exception as exc:
+            errors.append(f"{source}: {exc}")
+        finally:
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    return to_dataframe(all_tenders), errors
+
+
 def to_dataframe(tenders: list[Tender]) -> pd.DataFrame:
+    cols = list(Tender.__dataclass_fields__.keys())
     if not tenders:
-        return pd.DataFrame(columns=[f.name for f in Tender.__dataclass_fields__.values()])
+        return pd.DataFrame(columns=cols)
     df = pd.DataFrame([asdict(x) for x in tenders])
-    # Deduplicate updates. expediente is best; use title+organ when not available.
     df["_key"] = df["expediente"].fillna("").astype(str).str.strip()
     empty = df["_key"].eq("")
-    df.loc[empty, "_key"] = df.loc[empty, "titulo"].fillna("") + "|" + df.loc[empty, "organo"].fillna("")
+    df.loc[empty, "_key"] = (
+        df.loc[empty, "titulo"].fillna("") + "|" + df.loc[empty, "organo"].fillna("")
+    )
     df = df.sort_values(["fecha_actualizacion", "relevancia"], ascending=[False, False])
-    df = df.drop_duplicates("_key", keep="first").drop(columns="_key")
-    return df
+    return df.drop_duplicates("_key", keep="first").drop(columns="_key")
