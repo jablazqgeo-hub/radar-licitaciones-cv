@@ -1,0 +1,18 @@
+RADAR DE LICITACIONES - COMUNITAT VALENCIANA
+
+USO MUY SENCILLO EN WINDOWS
+
+1. Descomprime el archivo ZIP en una carpeta normal.
+2. Entra en la carpeta "radar_licitaciones_cv".
+3. Haz doble clic en "ABRIR_RADAR.bat".
+4. La primera vez puede instalar y preparar los componentes necesarios.
+5. Se abrira automaticamente el Radar en tu navegador.
+
+No necesitas escribir comandos de Python.
+
+IMPORTANTE
+- No ejecutes el archivo directamente desde dentro del ZIP: primero descomprimelo.
+- Mientras uses el Radar, deja abierta la ventana negra que aparece al iniciarlo.
+- Para cerrar el Radar, puedes cerrar la pestana del navegador y despues la ventana negra.
+
+Si Windows muestra una advertencia de seguridad sobre el archivo BAT, revisa que lo has descargado de esta conversacion y elige ejecutar solo si confias en el archivo.
