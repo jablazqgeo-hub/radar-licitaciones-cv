@@ -1,0 +1,14 @@
+{
+  "updated_at_utc": null,
+  "days": 30,
+  "opportunities": 0,
+  "diagnostics": {
+    "atom_pages": 0,
+    "reviewed": 0,
+    "within_period": 0,
+    "cv_local": 0,
+    "thematic": 0
+  },
+  "by_source": {},
+  "errors": []
+}
