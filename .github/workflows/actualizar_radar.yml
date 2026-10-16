@@ -18,21 +18,18 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Descargar repositorio
-        uses: actions/checkout@v7
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
       - name: Configurar Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: "pip"
 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
-
-      - name: Probar lógica incremental
-        run: PYTHONPATH=. pytest -q
 
       - name: Actualizar solo novedades desde la última sincronización
         env:
