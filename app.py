@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -43,19 +43,27 @@ df = load_data()
 with st.sidebar:
     st.header("Estado del radar")
     if meta:
-        raw = meta.get("updated_at_utc", "")
+        raw = meta.get("last_successful_sync_utc") or meta.get("updated_at_utc", "")
         try:
             dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
             updated_label = dt.strftime("%d/%m/%Y %H:%M UTC")
+            if age_hours > 48:
+                st.error(f"Datos desactualizados: última actualización correcta {updated_label}")
+                st.caption("Han pasado más de 48 h. Revisa GitHub Actions.")
+            elif age_hours > 30:
+                st.warning(f"Última actualización correcta: {updated_label}")
+            else:
+                st.success(f"Datos actualizados: {updated_label}")
         except Exception:
-            updated_label = raw or "No disponible"
-        st.success(f"Datos actualizados: {updated_label}")
-        st.caption(f"Ventana analizada: últimos {meta.get('days', 30)} días")
-        if meta.get("errors"):
-            st.warning("La última actualización tuvo avisos en alguna fuente oficial.")
+            st.info(f"Última actualización: {raw or 'No disponible'}")
+        st.caption(f"Conservación: últimos {meta.get('retention_days', 90)} días")
+        if meta.get("mode"):
+            st.caption(f"Modo de última sincronización: {meta.get('mode')}")
     else:
         st.warning("Aún no hay una actualización automática guardada.")
-        st.caption("Ejecuta una vez el workflow «Actualizar Radar de Licitaciones» en GitHub Actions.")
 
     st.divider()
     st.header("Filtros")
@@ -75,19 +83,15 @@ if meta:
     st.subheader("Última actualización automática")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("ATOM revisados", f"{diag.get('atom_pages', 0):,}")
-    c2.metric("Expedientes", f"{diag.get('reviewed', 0):,}")
-    c3.metric("En periodo", f"{diag.get('within_period', 0):,}")
-    c4.metric("CV / entidades locales", f"{diag.get('cv_local', 0):,}")
-    c5.metric("Temáticamente válidos", f"{diag.get('thematic', 0):,}")
+    c2.metric("Expedientes revisados", f"{diag.get('reviewed', 0):,}")
+    c3.metric("Nuevos/actualizados", f"{meta.get('new_or_updated_in_run', 0):,}")
+    c4.metric("Oportunidades guardadas", f"{meta.get('opportunities', len(df)):,}")
+    c5.metric("Duración", f"{meta.get('duration_seconds', 0) // 60} min")
 
 if df.empty:
-    if meta and meta.get("opportunities", 0) == 0:
-        st.info("La última actualización terminó correctamente, pero no encontró oportunidades que superasen los filtros geográfico y temático.")
-    else:
-        st.info("Todavía no hay datos precalculados. Ejecuta la actualización desde GitHub Actions y espera a que termine.")
+    st.info("Todavía no hay oportunidades guardadas. Ejecuta el workflow de GitHub Actions.")
     st.stop()
 
-# Asegurar tipos esperados.
 for col in ["titulo", "organo", "provincia", "categorias", "coincidencias", "texto", "enlace", "fecha_actualizacion", "fecha_limite", "presupuesto", "cpv"]:
     if col not in df.columns:
         df[col] = ""
@@ -116,7 +120,7 @@ m2.metric("Alta relevancia (≥70)", int((filtered["relevancia"] >= 70).sum()))
 m3.metric("Organismos", filtered.loc[filtered["organo"] != "Sin identificar", "organo"].nunique())
 
 if filtered.empty:
-    st.warning("Hay datos en el radar, pero ninguna oportunidad coincide con los filtros actuales. Prueba a bajar la relevancia mínima o ampliar familias/provincias.")
+    st.warning("Hay datos en el radar, pero ninguna oportunidad coincide con los filtros actuales.")
 else:
     cols = ["relevancia", "titulo", "organo", "provincia", "categorias", "fecha_actualizacion", "fecha_limite", "presupuesto", "cpv", "coincidencias", "enlace"]
     view = filtered.sort_values(["relevancia", "fecha_actualizacion"], ascending=[False, False])[cols]
@@ -139,4 +143,4 @@ else:
         "text/csv",
     )
 
-st.caption("Fuente: sindicación ATOM oficial de PLACSP. La actualización pesada se ejecuta en GitHub Actions; Streamlit solo muestra los resultados precalculados.")
+st.caption("Fuente: sindicación ATOM oficial de PLACSP. GitHub Actions actualiza incrementalmente; Streamlit solo muestra el CSV precalculado.")

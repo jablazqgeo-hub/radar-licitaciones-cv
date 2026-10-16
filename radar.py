@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Callable
@@ -79,7 +80,6 @@ def find_deadline(entry: ET.Element) -> str:
 
 
 def find_link(entry: ET.Element) -> str:
-    # Prefer the Atom entry link over generic URIs buried in CODICE.
     for node in list(entry):
         if lname(node.tag) == "link":
             href = (node.attrib.get("href") or "").strip()
@@ -199,15 +199,15 @@ def guess_province(address: str, organ: str, title: str, full_text: str) -> str:
     return "Sin determinar"
 
 
-def parse_dt(s: str):
+def parse_dt(s: str | None):
     if not s:
         return None
     try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         try:
-            return datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return datetime.strptime(str(s)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except Exception:
             return None
 
@@ -284,50 +284,55 @@ def parse_entry(entry: ET.Element, source: str, cutoff: datetime | None) -> tupl
     ), "ok"
 
 
-def download_atom(url: str, max_mb: int = 80) -> str:
-    tmp = tempfile.NamedTemporaryFile(suffix=".atom", delete=False)
-    path = tmp.name
-    tmp.close()
-    total = 0
-    try:
-        with requests.get(url, timeout=(15, 75), stream=True, headers={"User-Agent": "RadarLicitacionesCV/6.0"}) as r:
-            r.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > max_mb * 1024 * 1024:
-                        raise RuntimeError(f"El fichero supera {max_mb} MB")
-                    f.write(chunk)
-        return path
-    except Exception:
+def download_atom(url: str, max_mb: int = 80, attempts: int = 3) -> str:
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        tmp = tempfile.NamedTemporaryFile(suffix=".atom", delete=False)
+        path = tmp.name
+        tmp.close()
+        total = 0
         try:
-            os.remove(path)
-        except OSError:
-            pass
-        raise
+            with requests.get(
+                url,
+                timeout=(12, 45),
+                stream=True,
+                headers={"User-Agent": "RadarLicitacionesCV/8.0"},
+            ) as r:
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(1024 * 1024):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > max_mb * 1024 * 1024:
+                            raise RuntimeError(f"El fichero supera {max_mb} MB")
+                        f.write(chunk)
+            return path
+        except Exception as exc:
+            last_exc = exc
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if attempt == attempts:
+                raise
+    raise RuntimeError(str(last_exc))
 
 
 def feed_older_link(path: str, base_url: str) -> str | None:
-    """PLACSP usa rel='next' para enlazar con el siguiente fichero a procesar,
-    que contiene las actualizaciones anteriores más próximas temporalmente.
-    """
     try:
         root = ET.parse(path).getroot()
-        direct_links = []
+        links = []
         for node in list(root):
             if lname(node.tag) == "link":
                 rel = (node.attrib.get("rel") or "").strip().lower()
                 href = (node.attrib.get("href") or "").strip()
                 if href:
-                    direct_links.append((rel, urljoin(base_url, href)))
-        # Según la documentación de PLACSP, NEXT es el fichero siguiente a procesar (más antiguo).
-        for rel, href in direct_links:
+                    links.append((rel, urljoin(base_url, href)))
+        for rel, href in links:
             if rel == "next" and href != base_url:
                 return href
-        # Fallback defensivo para paquetes/feeds antiguos con semántica distinta.
-        for rel, href in direct_links:
+        for rel, href in links:
             if rel == "prev" and href != base_url:
                 return href
     except Exception:
@@ -336,43 +341,6 @@ def feed_older_link(path: str, base_url: str) -> str | None:
 
 
 def parse_atom_page(path: str, source: str, cutoff: datetime) -> tuple[list[Tender], datetime | None, datetime | None, Diagnostics]:
-    out: list[Tender] = []
-    newest = oldest = None
-    d = Diagnostics(paginas=1)
-    try:
-        for _event, elem in ET.iterparse(path, events=("end",)):
-            if lname(elem.tag) == "entry":
-                d.expedientes_revisados += 1
-                dt = parse_dt(first_text(elem, {"updated"}))
-                if dt is not None:
-                    newest = dt if newest is None or dt > newest else newest
-                    oldest = dt if oldest is None or dt < oldest else oldest
-                    if dt >= cutoff:
-                        d.dentro_periodo += 1
-                tender, reason = parse_entry(elem, source, cutoff)
-                if reason not in {"old", "not_cv_local"}:
-                    d.cv_locales += 1
-                elif reason == "not_cv_local":
-                    pass
-                # Count CV locals independently to keep diagnostics truthful.
-                if reason in {"not_thematic", "ok"}:
-                    d.cv_locales += 1 if False else 0
-                if reason == "not_thematic":
-                    pass
-                if reason == "ok" and tender is not None:
-                    d.tematicos += 1
-                    d.oportunidades += 1
-                    out.append(tender)
-                elem.clear()
-    except ET.ParseError as exc:
-        raise RuntimeError(f"ATOM/XML inválido: {exc}") from exc
-
-    # Recalculate intermediate diagnostic counts accurately in a second lightweight pass is avoided.
-    # 'cv_locales' and 'tematicos' are populated in load_feed_history using reason counters.
-    return out, newest, oldest, d
-
-
-def parse_atom_page_diagnostic(path: str, source: str, cutoff: datetime) -> tuple[list[Tender], datetime | None, datetime | None, Diagnostics]:
     out: list[Tender] = []
     newest = oldest = None
     d = Diagnostics(paginas=1)
@@ -405,11 +373,11 @@ def parse_atom_page_diagnostic(path: str, source: str, cutoff: datetime) -> tupl
     return out, newest, oldest, d
 
 
-def load_feed_history(
+def load_feed_since(
     source: str,
     first_url: str,
     cutoff: datetime,
-    max_pages: int = 240,
+    max_pages: int = 60,
     progress: Callable[[str, int, Diagnostics, datetime | None], None] | None = None,
 ) -> tuple[list[Tender], list[str], Diagnostics]:
     tenders: list[Tender] = []
@@ -423,17 +391,14 @@ def load_feed_history(
         path = None
         try:
             path = download_atom(url)
-            page_tenders, newest, oldest, pdg = parse_atom_page_diagnostic(path, source, cutoff)
+            page_tenders, _newest, oldest, pdg = parse_atom_page(path, source, cutoff)
             tenders.extend(page_tenders)
             diag.add(pdg)
-
             if progress:
                 progress(source, diag.paginas, diag, oldest)
 
-            # Once this page reaches beyond the requested window, older pages are unnecessary.
             if oldest is not None and oldest < cutoff:
                 break
-
             older_url = feed_older_link(path, url)
             if not older_url or older_url in seen_urls:
                 break
@@ -453,19 +418,29 @@ def load_feed_history(
     return tenders, errors, diag
 
 
-def load_recent(days: int = 30, progress=None) -> tuple[pd.DataFrame, list[str], Diagnostics, dict[str, dict]]:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+def load_incremental_since(
+    cutoff: datetime,
+    progress=None,
+    max_pages_per_source: int = 60,
+) -> tuple[pd.DataFrame, list[str], Diagnostics, dict[str, dict]]:
+    """Lee solo desde el presente hasta `cutoff` y procesa las dos fuentes en paralelo."""
     all_tenders: list[Tender] = []
     errors: list[str] = []
     total = Diagnostics()
     by_source: dict[str, dict] = {}
 
-    for source, url in FEEDS.items():
-        tenders, errs, diag = load_feed_history(source, url, cutoff, progress=progress)
-        all_tenders.extend(tenders)
-        errors.extend(errs)
-        total.add(diag)
-        by_source[source] = asdict(diag)
+    def run_one(item):
+        source, url = item
+        return source, load_feed_since(source, url, cutoff, max_pages=max_pages_per_source, progress=progress)
+
+    with ThreadPoolExecutor(max_workers=min(2, len(FEEDS))) as pool:
+        futures = [pool.submit(run_one, item) for item in FEEDS.items()]
+        for future in as_completed(futures):
+            source, (tenders, errs, diag) = future.result()
+            all_tenders.extend(tenders)
+            errors.extend(errs)
+            total.add(diag)
+            by_source[source] = asdict(diag)
 
     df = to_dataframe(all_tenders)
     total.oportunidades = len(df)
@@ -477,9 +452,37 @@ def to_dataframe(tenders: list[Tender]) -> pd.DataFrame:
     if not tenders:
         return pd.DataFrame(columns=cols)
     df = pd.DataFrame([asdict(x) for x in tenders])
+    return dedupe_dataframe(df)
+
+
+def dedupe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    cols = list(Tender.__dataclass_fields__.keys())
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    for col in cols:
+        if col not in df.columns:
+            df[col] = "" if col != "relevancia" else 0
+    df = df[cols].copy()
     df["_key"] = df["expediente"].fillna("").astype(str).str.strip()
     empty = df["_key"].eq("")
-    df.loc[empty, "_key"] = df.loc[empty, "titulo"].fillna("") + "|" + df.loc[empty, "organo"].fillna("")
+    df.loc[empty, "_key"] = (
+        df.loc[empty, "titulo"].fillna("").astype(str) + "|" +
+        df.loc[empty, "organo"].fillna("").astype(str)
+    )
     df["_updated"] = pd.to_datetime(df["fecha_actualizacion"], errors="coerce", utc=True)
-    df = df.sort_values("_updated").drop_duplicates("_key", keep="last")
+    df = df.sort_values("_updated", na_position="first").drop_duplicates("_key", keep="last")
     return df.drop(columns=["_key", "_updated"]).reset_index(drop=True)
+
+
+def merge_incremental(existing: pd.DataFrame, fresh: pd.DataFrame, retention_days: int = 90, now: datetime | None = None) -> pd.DataFrame:
+    """Fusiona novedades con el histórico, conserva la versión más reciente y poda datos antiguos."""
+    now = now or datetime.now(timezone.utc)
+    frames = [x for x in [existing, fresh] if x is not None and not x.empty]
+    if not frames:
+        return dedupe_dataframe(pd.DataFrame())
+    merged = dedupe_dataframe(pd.concat(frames, ignore_index=True, sort=False))
+    cutoff = now - timedelta(days=retention_days)
+    upd = pd.to_datetime(merged["fecha_actualizacion"], errors="coerce", utc=True)
+    # Conservar registros sin fecha para no perder oportunidades por datos oficiales incompletos.
+    merged = merged[upd.isna() | (upd >= cutoff)].copy()
+    return dedupe_dataframe(merged)
