@@ -14,14 +14,16 @@ concurrency:
 
 jobs:
   actualizar:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Descargar repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
 
       - name: Configurar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: "pip"
@@ -29,12 +31,19 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Actualizar datos del radar
+      - name: Probar lógica incremental
+        run: PYTHONPATH=. pytest -q
+
+      - name: Actualizar solo novedades desde la última sincronización
         env:
-          RADAR_DAYS: "30"
+          RADAR_RETENTION_DAYS: "90"
+          RADAR_OVERLAP_HOURS: "12"
+          RADAR_BOOTSTRAP_DAYS: "3"
+          RADAR_MAX_PAGES_PER_SOURCE: "40"
         run: python updater.py
 
       - name: Guardar resultados en el repositorio
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -42,6 +51,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No hay cambios en los datos."
           else
-            git commit -m "Actualización automática del radar"
-            git push
+            git commit -m "Actualización incremental automática del radar"
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            git push origin "HEAD:$GITHUB_REF_NAME"
           fi
