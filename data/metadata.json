@@ -1,33 +1,33 @@
 {
-  "updated_at_utc": "2026-10-25T05:54:05.666780+00:00",
-  "last_successful_sync_utc": "2026-10-25T05:54:05.666780+00:00",
-  "incremental_from_utc": "2026-10-23T18:06:45.582202+00:00",
+  "updated_at_utc": "2026-10-26T05:58:31.031449+00:00",
+  "last_successful_sync_utc": "2026-10-26T05:58:31.031449+00:00",
+  "incremental_from_utc": "2026-10-24T17:54:05.666780+00:00",
   "mode": "incremental",
   "retention_days": 90,
   "opportunities": 42,
   "new_or_updated_in_run": 0,
-  "duration_seconds": 41,
+  "duration_seconds": 15,
   "diagnostics": {
-    "atom_pages": 2,
-    "reviewed": 708,
-    "within_period": 127,
-    "cv_local": 10,
+    "atom_pages": 3,
+    "reviewed": 890,
+    "within_period": 186,
+    "cv_local": 23,
     "thematic": 0
   },
   "by_source": {
     "PLACSP - agregadas": {
       "paginas": 1,
-      "expedientes_revisados": 298,
-      "dentro_periodo": 56,
-      "cv_locales": 0,
+      "expedientes_revisados": 323,
+      "dentro_periodo": 29,
+      "cv_locales": 1,
       "tematicos": 0,
       "oportunidades": 0
     },
     "PLACSP - perfiles": {
-      "paginas": 1,
-      "expedientes_revisados": 410,
-      "dentro_periodo": 71,
-      "cv_locales": 10,
+      "paginas": 2,
+      "expedientes_revisados": 567,
+      "dentro_periodo": 157,
+      "cv_locales": 22,
       "tematicos": 0,
       "oportunidades": 0
     }
